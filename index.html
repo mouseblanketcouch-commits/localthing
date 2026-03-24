@@ -68,6 +68,12 @@
             .top-bar { flex-direction: column; gap: 10px; align-items: flex-start; }
             .cam-status { align-self: center; margin-top: 5px; }
         }
+        /* New Controls */
+        .controls-panel { display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap; }
+        .action-btn { background: rgba(255,255,255,0.2); border: 1px solid #555; color: white; padding: 8px 15px; border-radius: 6px; cursor: pointer; font-size: 14px; backdrop-filter: blur(5px); transition: background 0.2s; }
+        .action-btn:active { background: rgba(255,255,255,0.4); }
+        .speak-btn { background: var(--primary); font-weight: bold; border: none; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+        #main-video { transition: transform 0.3s ease; }
     </style>
 </head>
 <body>
@@ -121,7 +127,14 @@
     <!-- ROOM PAGE -->
     <div id="room-page" class="page">
         <div class="top-bar">
-            <button class="top-left-btn" onclick="createCameraSequence()">Create Camera Sequence...</button>
+            <div>
+                <button class="top-left-btn" onclick="createCameraSequence()">Create Camera Sequence...</button>
+                <div class="controls-panel">
+                    <button class="action-btn" id="flip-btn" onclick="flipCamera()" style="display:none;">Flip Camera</button>
+                    <button class="action-btn" onclick="rotateCamera()">Rotate View</button>
+                    <button class="action-btn speak-btn" id="speak-btn">Hold to Speak</button>
+                </div>
+            </div>
             <div class="cam-status" id="cam-status">No Cameras Connected</div>
         </div>
 
@@ -153,6 +166,17 @@
         // Array of available camera streams. Format: { id: 'local' | clientId, stream: MediaStream }
         let allCameras =[]; 
         let currentViewIndex = 0;
+        let currentFacingMode = "environment";
+        let pttStream = null;
+
+        // Device fingerprinting for saving rotation
+        let myDeviceId = localStorage.getItem('sec_cam_device_id');
+        if (!myDeviceId) {
+            myDeviceId = 'dev_' + Math.random().toString(36).substr(2, 9);
+            localStorage.setItem('sec_cam_device_id', myDeviceId);
+        }
+        let peerDevices = {}; // Maps peerId to their persistent device fingerprint
+        let savedRotations = JSON.parse(localStorage.getItem('sec_cam_rotations') || '{}');
 
         const ICE_SERVERS = { iceServers:[{ urls: 'stun:stun.l.google.com:19302' }] };
 
@@ -275,6 +299,9 @@
             videoEl.muted = (currentCam.id === 'local');
             
             statusEl.innerText = `Viewing Camera ${currentViewIndex + 1} of ${allCameras.length}`;
+            document.getElementById('flip-btn').style.display = (currentCam.id === 'local') ? 'inline-block' : 'none';
+            document.getElementById('speak-btn').style.display = (currentCam.id === 'local') ? 'none' : 'inline-block';
+            applyRotation();
         }
 
         function switchCam(direction) {
@@ -306,13 +333,30 @@
                 }
             };
 
+            // Send our persistent device fingerprint to the new peer
+            setTimeout(() => sendSignal(peerId, { type: 'device_id', deviceId: myDeviceId }), 1000);
+
             pc.ontrack = (event) => {
-                // When we receive a camera feed from someone else
                 const stream = event.streams[0];
-                if (!allCameras.find(c => c.id === peerId)) {
-                    allCameras.push({ id: peerId, stream });
-                    showToast("New remote camera sequence linked.", false);
-                    updateVideoUI();
+                const hasVideo = stream.getVideoTracks().length > 0;
+
+                if (hasVideo) {
+                    // It's a Camera Feed
+                    if (!allCameras.find(c => c.id === peerId)) {
+                        allCameras.push({ id: peerId, stream });
+                        showToast("New remote camera sequence linked.", false);
+                        updateVideoUI();
+                    }
+                } else {
+                    // It's Audio Only (Viewer using Push-To-Talk)
+                    let audioEl = document.getElementById('remote-audio-' + peerId);
+                    if (!audioEl) {
+                        audioEl = document.createElement('audio');
+                        audioEl.id = 'remote-audio-' + peerId;
+                        audioEl.autoplay = true;
+                        document.body.appendChild(audioEl);
+                    }
+                    audioEl.srcObject = stream;
                 }
             };
 
@@ -343,6 +387,10 @@
             else if (signal.type === 'ice') {
                 if (pc) await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
             }
+            else if (signal.type === 'device_id') {
+                peerDevices[fromId] = signal.deviceId;
+                applyRotation();
+            }
         }
 
         function handlePeerDisconnect(peerId) {
@@ -362,6 +410,108 @@
                 updateVideoUI();
             }
         }
+
+        // --- Flip Camera Logic ---
+        async function flipCamera() {
+            if (!localStream) return;
+            currentFacingMode = currentFacingMode === "environment" ? "user" : "environment";
+            
+            try {
+                const newStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: currentFacingMode, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
+                    audio: true
+                });
+                
+                const oldVideoTrack = localStream.getVideoTracks()[0];
+                const newVideoTrack = newStream.getVideoTracks()[0];
+                
+                // Replace live track for viewers without dropping WebRTC connection
+                Object.values(peers).forEach(pc => {
+                    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                    if (sender) sender.replaceTrack(newVideoTrack);
+                });
+                
+                oldVideoTrack.stop();
+                localStream.removeTrack(oldVideoTrack);
+                localStream.addTrack(newVideoTrack);
+                
+                if (allCameras.length > 0 && allCameras[currentViewIndex].id === 'local') {
+                    document.getElementById('main-video').srcObject = localStream;
+                }
+            } catch (err) {
+                showToast("Failed to flip camera.", true);
+            }
+        }
+
+        // --- Rotation & Fingerprinting Logic ---
+        function applyRotation() {
+            if (allCameras.length === 0) return;
+            const currentCam = allCameras[currentViewIndex];
+            // ID matches local memory or mapped remote device fingerprint
+            const targetId = currentCam.id === 'local' ? myDeviceId : (peerDevices[currentCam.id] || currentCam.id);
+            const deg = savedRotations[targetId] || 0;
+            document.getElementById('main-video').style.transform = `rotate(${deg}deg)`;
+        }
+
+        function rotateCamera() {
+            if (allCameras.length === 0) return;
+            const currentCam = allCameras[currentViewIndex];
+            const targetId = currentCam.id === 'local' ? myDeviceId : (peerDevices[currentCam.id] || currentCam.id);
+            
+            let currRot = savedRotations[targetId] || 0;
+            currRot = (currRot + 90) % 360; // rotate by 90
+            savedRotations[targetId] = currRot;
+            localStorage.setItem('sec_cam_rotations', JSON.stringify(savedRotations));
+            
+            applyRotation();
+        }
+
+        // --- Push-To-Talk Logic ---
+        async function initPTT() {
+            if (!pttStream) {
+                try {
+                    pttStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    pttStream.getAudioTracks()[0].enabled = false; // Muted by default
+                    
+                    // Add our audio to the WebRTC connection mesh
+                    Object.values(peers).forEach(pc => {
+                        pttStream.getTracks().forEach(track => pc.addTrack(track, pttStream));
+                    });
+                    showToast("Microphone enabled for Intercom.", false);
+                    return true;
+                } catch (err) {
+                    showToast("Microphone permission denied.", true);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        async function startSpeak(e) {
+            e.preventDefault();
+            if (allCameras.length === 0 || allCameras[currentViewIndex].id === 'local') return;
+            const ready = await initPTT();
+            if (ready && pttStream) {
+                pttStream.getAudioTracks()[0].enabled = true; // Unmute
+                document.getElementById('speak-btn').style.backgroundColor = 'var(--danger)';
+            }
+        }
+
+        function stopSpeak(e) {
+            e.preventDefault();
+            if (pttStream) {
+                pttStream.getAudioTracks()[0].enabled = false; // Mute
+                document.getElementById('speak-btn').style.backgroundColor = 'var(--primary)';
+            }
+        }
+
+        // Bind Hold-to-speak events (Mouse and Mobile Touch)
+        const speakBtn = document.getElementById('speak-btn');
+        speakBtn.addEventListener('mousedown', startSpeak);
+        speakBtn.addEventListener('mouseup', stopSpeak);
+        speakBtn.addEventListener('mouseleave', stopSpeak);
+        speakBtn.addEventListener('touchstart', startSpeak);
+        speakBtn.addEventListener('touchend', stopSpeak);
     </script>
 </body>
 </html>

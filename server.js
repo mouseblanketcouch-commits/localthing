@@ -37,26 +37,26 @@ const server = http.createServer((req, res) => {
         return res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
     }
     
-    // Save Camera Feed Chunks
+    // Save Camera Feed Chunks (Independent segments)
     if (urlObj.pathname === '/upload') {
         const room = urlObj.searchParams.get('room');
         const pwd = urlObj.searchParams.get('pwd');
-        const camId = urlObj.searchParams.get('camId');
-        const start = urlObj.searchParams.get('start');
+        const filename = urlObj.searchParams.get('filename');
         
         if (!authRoom(room, pwd)) { res.writeHead(403); return res.end(); }
         
         const recDir = path.join(__dirname, 'recordings');
         if (!fs.existsSync(recDir)) fs.mkdirSync(recDir);
         
-        // Append chunks sequentially to create a complete WebM file
-        const writeStream = fs.createWriteStream(path.join(recDir, `${room}_${camId}_${start}.webm`), { flags: 'a' });
+        const safeFilename = path.basename(filename || '');
+        if (!safeFilename) { res.writeHead(400); return res.end(); }
+        const writeStream = fs.createWriteStream(path.join(recDir, safeFilename));
         req.pipe(writeStream);
         req.on('end', () => { res.writeHead(200); res.end(); });
         return;
     }
     
-    // Get list of room's recordings
+    // Get list of room's recordings grouped by Sessions
     if (urlObj.pathname === '/recordings-list') {
         const room = urlObj.searchParams.get('room');
         const pwd = urlObj.searchParams.get('pwd');
@@ -65,14 +65,29 @@ const server = http.createServer((req, res) => {
         const recDir = path.join(__dirname, 'recordings');
         if (!fs.existsSync(recDir)) { res.writeHead(200); return res.end('[]'); }
         
-        const files = fs.readdirSync(recDir).filter(f => f.startsWith(room + '_') && f.endsWith('.webm'));
-        const list = files.map(f => {
-            const parts = f.replace('.webm', '').split('_');
-            return { filename: f, camId: parts[1], start: parseInt(parts[2], 10) };
+        const safeRoom = encodeURIComponent(room).replace(/---/g, '');
+        const files = fs.readdirSync(recDir).filter(f => f.startsWith(safeRoom + '---'));
+        const sessions = {};
+        
+        files.forEach(f => {
+            const parts = f.split('---');
+            if (parts.length < 4) return;
+            const camId = decodeURIComponent(parts[1]);
+            const sessionStart = parseInt(parts[2], 10);
+            const chunkStart = parseInt(parts[3].split('.')[0], 10);
+            
+            if (!sessions[sessionStart]) {
+                sessions[sessionStart] = { sessionStart, camId, chunks:[] };
+            }
+            sessions[sessionStart].chunks.push({ chunkStart, filename: f });
         });
         
+        // Sort chunks inside each session chronologically
+        Object.values(sessions).forEach(s => s.chunks.sort((a, b) => a.chunkStart - b.chunkStart));
+        
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify(list));
+        // Return sessions sorted newest to oldest
+        return res.end(JSON.stringify(Object.values(sessions).sort((a,b) => b.sessionStart - a.sessionStart)));
     }
 
     // Serve Video File with Range Support (Allows Timeline Seeking)
@@ -82,6 +97,8 @@ const server = http.createServer((req, res) => {
         
         const stat = fs.statSync(filePath);
         const range = req.headers.range;
+        const ext = path.extname(filePath).toLowerCase();
+        const contentType = ext === '.mp4' ? 'video/mp4' : 'video/webm';
         
         if (range) {
             const parts = range.replace(/bytes=/, "").split("-");
@@ -94,11 +111,11 @@ const server = http.createServer((req, res) => {
                 'Content-Range': `bytes ${start}-${end}/${stat.size}`,
                 'Accept-Ranges': 'bytes',
                 'Content-Length': chunksize,
-                'Content-Type': 'video/webm'
+                'Content-Type': contentType
             });
             file.pipe(res);
         } else {
-            res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': 'video/webm' });
+            res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': contentType });
             fs.createReadStream(filePath).pipe(res);
         }
         return;

@@ -72,6 +72,9 @@
         .action-btn:active { background: rgba(255,255,255,0.4); }
         .speak-btn { background: var(--primary); font-weight: bold; border: none; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
         #main-video { transition: transform 0.3s ease; }
+        /* Custom Timeline Slider */
+        input[type="range"] { -webkit-appearance: none; width: 100%; height: 8px; background: #444; border-radius: 4px; outline: none; margin-top: 15px; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: var(--primary); border-radius: 50%; cursor: pointer; }
     </style>
 </head>
 <body>
@@ -164,11 +167,15 @@
                 <!-- Auto-populated history files -->
             </div>
             
-            <div style="flex-grow:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 20px;">
-                <video id="history-video" controls playsinline webkit-playsinline style="max-height: 60vh; max-width: 100%; display:none; border-radius: 8px;"></video>
-                <div id="history-info" style="color:white; margin-top: 20px; font-size: 20px; display:none; font-weight: bold;">
-                    Time: <span id="h-local-time" style="color:var(--primary);">--:--:--</span> | 
-                    Elapsed: <span id="h-elapsed" style="color:var(--success);">0:00:00</span>
+            <div style="flex-grow:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 20px; position:relative;">
+                <video id="history-video" playsinline webkit-playsinline style="max-height: 50vh; max-width: 100%; display:none; border-radius: 8px; background:#000;"></video>
+                
+                <div id="history-controls" style="width: 100%; max-width: 600px; display:none; flex-direction: column; margin-top: 20px;">
+                    <input type="range" id="history-slider" min="0" max="100" value="0">
+                    <div style="display:flex; justify-content:space-between; color:white; margin-top:10px; font-weight:bold;">
+                        <span id="h-local-time" style="color:var(--primary);">--:--:--</span>
+                        <span id="h-elapsed" style="color:var(--success);">0:00:00</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -181,7 +188,6 @@
         let currentRoom = '';
         let currentPwd = '';
         let mediaRecorder = null;
-        let recordingStartTime = 0;
         let peers = {}; // clientId -> RTCPeerConnection
         
         // Array of available camera streams. Format: { id: 'local' | clientId, stream: MediaStream }
@@ -195,7 +201,8 @@
         // Device fingerprinting for saving rotation
         let myDeviceId = localStorage.getItem('sec_cam_device_id');
         if (!myDeviceId) {
-            myDeviceId = 'dev_' + Math.random().toString(36).substr(2, 9);
+            const randNum = Math.floor(Math.random() * 900 + 100).toString();
+            myDeviceId = `CAMERA-${randNum}`;
             localStorage.setItem('sec_cam_device_id', myDeviceId);
         }
         let peerDevices = {}; // Maps peerId to their persistent device fingerprint
@@ -655,75 +662,175 @@
         }
 
         // --- Recording & History Logic ---
-        function startRecording(stream) {
-            recordingStartTime = Date.now();
-            const mimeType = MediaRecorder.isTypeSupported('video/webm; codecs=vp8,opus') ? 'video/webm; codecs=vp8,opus' : 'video/webm';
-            
-            try { mediaRecorder = new MediaRecorder(stream, { mimeType }); } 
-            catch (e) { mediaRecorder = new MediaRecorder(stream); } // Safari fallback
+        let isRecording = false;
+        let currentRecordSession = 0;
+        let currentSession = null;
+        let currentChunk = null;
+        let isDraggingSlider = false;
 
-            mediaRecorder.ondataavailable = async (e) => {
-                if (e.data && e.data.size > 0 && currentRoom && currentPwd) {
-                    try {
-                        // Send chunks over HTTP to ensure persistent saves
-                        await fetch(`/upload?room=${encodeURIComponent(currentRoom)}&pwd=${encodeURIComponent(currentPwd)}&camId=${encodeURIComponent(myDeviceId)}&start=${recordingStartTime}`, {
-                            method: 'POST', body: e.data
-                        });
-                    } catch(err) {}
-                }
-            };
-            mediaRecorder.start(5000); // Send chunks to server every 5 seconds securely
+        function startRecording(stream) {
+            isRecording = true;
+            currentRecordSession = Date.now();
+            
+            function recordChunk() {
+                if (!isRecording) return;
+                const chunkStartTime = Date.now();
+                let chunks =[];
+                
+                // Proper fallback for iOS WebKit to avoid missing history
+                const mimeType = (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm; codecs=vp8,opus')) 
+                                 ? 'video/webm; codecs=vp8,opus' 
+                                 : 'video/mp4'; 
+                const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+                
+                try { mediaRecorder = new MediaRecorder(stream, { mimeType }); } 
+                catch (e) { mediaRecorder = new MediaRecorder(stream); } 
+                
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data && e.data.size > 0) chunks.push(e.data);
+                };
+                
+                mediaRecorder.onstop = () => {
+                    const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+                    if (blob.size > 0 && currentRoom && currentPwd) {
+                        const safeRoom = encodeURIComponent(currentRoom).replace(/---/g, '');
+                        const safeCam = encodeURIComponent(myDeviceId).replace(/---/g, '');
+                        // Safe delimiter "---" prevents splitting bugs (fixes 3 AM bug)
+                        const filename = `${safeRoom}---${safeCam}---${currentRecordSession}---${chunkStartTime}.${ext}`;
+                        
+                        fetch(`/upload?room=${encodeURIComponent(currentRoom)}&pwd=${encodeURIComponent(currentPwd)}&filename=${encodeURIComponent(filename)}`, {
+                            method: 'POST', body: blob, keepalive: true
+                        }).catch(()=>{});
+                    }
+                    recordChunk(); // Start next chunk immediately to prevent gaps
+                };
+                
+                mediaRecorder.start();
+                // Force save every 30 seconds. Ensures timeline is full and iOS buffer strictly flushes!
+                setTimeout(() => {
+                    if (mediaRecorder.state === 'recording') mediaRecorder.stop();
+                }, 30000); 
+            }
+            recordChunk();
         }
 
         async function openHistory() {
             if (!currentRoom) return showToast("Join a room first.", true);
             const res = await fetch(`/recordings-list?room=${encodeURIComponent(currentRoom)}&pwd=${encodeURIComponent(currentPwd)}`);
-            const list = await res.json();
+            const sessions = await res.json();
             
             const listContainer = document.getElementById('history-list');
             listContainer.innerHTML = '';
             
-            if (list.length === 0) listContainer.innerHTML = '<div style="color:#aaa;">No history found.</div>';
+            if (sessions.length === 0) listContainer.innerHTML = '<div style="color:#aaa;">No history found.</div>';
             
-            list.forEach(item => {
+            sessions.forEach(session => {
                 const btn = document.createElement('button');
                 btn.className = 'menu-btn';
                 btn.style.width = 'auto'; btn.style.padding = '10px'; btn.style.margin = '0';
-                btn.innerText = `Cam: ${item.camId.substring(0,6)}\nStarted: ${new Date(item.start).toLocaleTimeString()}`;
-                btn.onclick = () => playHistory(item);
+                
+                // Get total duration from chunks
+                const lastChunk = session.chunks[session.chunks.length - 1];
+                const totalSecs = Math.round((lastChunk.chunkStart - session.sessionStart + 30000) / 1000);
+                const mins = Math.floor(totalSecs / 60);
+                
+                btn.innerText = `${session.camId}\nStarted: ${new Date(session.sessionStart).toLocaleTimeString()}\nDur: ~${mins}m`;
+                btn.onclick = () => playHistory(session);
                 listContainer.appendChild(btn);
             });
             switchPage('history-page');
         }
 
-        function playHistory(item) {
+        function playHistory(session) {
+            currentSession = session;
             const video = document.getElementById('history-video');
-            document.getElementById('history-info').style.display = 'block';
+            document.getElementById('history-controls').style.display = 'flex';
             video.style.display = 'block';
-            video.src = `/recordings/${item.filename}`;
-            video.play().catch(()=>{}); // Load into player
             
+            // Set up timeline
+            const slider = document.getElementById('history-slider');
+            const maxSecs = (session.chunks[session.chunks.length - 1].chunkStart - session.sessionStart + 30000) / 1000;
+            slider.max = maxSecs;
+            slider.value = 0;
+            
+            seekToTime(0); // Load first chunk
+            
+            // Automatically play the next chunk when the 30-second piece ends
+            video.onended = () => {
+                const idx = currentSession.chunks.indexOf(currentChunk);
+                if (idx >= 0 && idx < currentSession.chunks.length - 1) {
+                    currentChunk = currentSession.chunks[idx + 1];
+                    video.src = `/recordings/${currentChunk.filename}`;
+                    video.onloadedmetadata = () => { video.currentTime = 0; video.play().catch(()=>{}); };
+                }
+            };
+
+            // Fluid UI updater
             if (window.historyInterval) clearInterval(window.historyInterval);
             window.historyInterval = setInterval(() => {
-                // Dynamically calculates timeline metrics while you scroll the bar
-                if (!video.paused && !video.seeking) {
-                    const currentTime = video.currentTime;
-                    const actualTime = new Date(item.start + (currentTime * 1000));
+                if (!video.paused && !video.seeking && currentChunk) {
+                    const chunkOffset = (currentChunk.chunkStart - currentSession.sessionStart) / 1000;
+                    const totalPlayed = chunkOffset + video.currentTime;
                     
-                    document.getElementById('h-local-time').innerText = actualTime.toLocaleTimeString();
-                    
-                    const hrs = Math.floor(currentTime / 3600);
-                    const mins = Math.floor((currentTime % 3600) / 60);
-                    const secs = Math.floor(currentTime % 60);
-                    document.getElementById('h-elapsed').innerText = `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                    if (!isDraggingSlider) slider.value = totalPlayed;
+                    updateTimeTexts(totalPlayed);
                 }
             }, 500);
         }
+
+        function seekToTime(targetTimeSeconds) {
+            let targetChunk = currentSession.chunks[0];
+            for (let i = currentSession.chunks.length - 1; i >= 0; i--) {
+                const offset = (currentSession.chunks[i].chunkStart - currentSession.sessionStart) / 1000;
+                if (targetTimeSeconds >= offset) {
+                    targetChunk = currentSession.chunks[i];
+                    break;
+                }
+            }
+            
+            const offsetIntoChunk = targetTimeSeconds - ((targetChunk.chunkStart - currentSession.sessionStart) / 1000);
+            const video = document.getElementById('history-video');
+            
+            if (currentChunk !== targetChunk) {
+                currentChunk = targetChunk;
+                video.src = `/recordings/${targetChunk.filename}`;
+                video.onloadedmetadata = () => {
+                    video.currentTime = offsetIntoChunk;
+                    video.play().catch(()=>{});
+                    video.onloadedmetadata = null;
+                };
+            } else {
+                video.currentTime = offsetIntoChunk;
+                video.play().catch(()=>{});
+            }
+            updateTimeTexts(targetTimeSeconds);
+        }
+
+        function updateTimeTexts(totalSeconds) {
+            const actualTime = new Date(currentSession.sessionStart + (totalSeconds * 1000));
+            document.getElementById('h-local-time').innerText = actualTime.toLocaleTimeString();
+            
+            const hrs = Math.floor(totalSeconds / 3600);
+            const mins = Math.floor((totalSeconds % 3600) / 60);
+            const secs = Math.floor(totalSeconds % 60);
+            document.getElementById('h-elapsed').innerText = `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        // Slider Interaction Setup
+        const slider = document.getElementById('history-slider');
+        slider.onmousedown = () => isDraggingSlider = true;
+        slider.ontouchstart = () => isDraggingSlider = true;
+        slider.oninput = (e) => updateTimeTexts(parseFloat(e.target.value));
+        slider.onchange = (e) => {
+            isDraggingSlider = false;
+            seekToTime(parseFloat(e.target.value));
+        };
 
         function closeHistory() {
             const video = document.getElementById('history-video');
             video.pause();
             video.src = "";
+            document.getElementById('history-controls').style.display = 'none';
             if (window.historyInterval) clearInterval(window.historyInterval);
             switchPage('room-page');
         }

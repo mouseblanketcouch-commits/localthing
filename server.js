@@ -21,15 +21,91 @@ const saveRooms = () => {
     fs.writeFileSync(ROOMS_FILE, JSON.stringify(rooms, null, 2));
 };
 
-// HTTP Server to serve index.html
 const server = http.createServer((req, res) => {
-    if (req.url === '/') {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    
+    // Auth Helper
+    const authRoom = (roomName, password) => {
+        const room = rooms[roomName];
+        if (!room) return false;
+        const hash = crypto.pbkdf2Sync(password, room.salt, 1000, 64, 'sha512').toString('hex');
+        return hash === room.hash;
+    };
+
+    if (urlObj.pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
-    } else {
-        res.writeHead(404);
-        res.end();
+        return res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
     }
+    
+    // Save Camera Feed Chunks
+    if (urlObj.pathname === '/upload') {
+        const room = urlObj.searchParams.get('room');
+        const pwd = urlObj.searchParams.get('pwd');
+        const camId = urlObj.searchParams.get('camId');
+        const start = urlObj.searchParams.get('start');
+        
+        if (!authRoom(room, pwd)) { res.writeHead(403); return res.end(); }
+        
+        const recDir = path.join(__dirname, 'recordings');
+        if (!fs.existsSync(recDir)) fs.mkdirSync(recDir);
+        
+        // Append chunks sequentially to create a complete WebM file
+        const writeStream = fs.createWriteStream(path.join(recDir, `${room}_${camId}_${start}.webm`), { flags: 'a' });
+        req.pipe(writeStream);
+        req.on('end', () => { res.writeHead(200); res.end(); });
+        return;
+    }
+    
+    // Get list of room's recordings
+    if (urlObj.pathname === '/recordings-list') {
+        const room = urlObj.searchParams.get('room');
+        const pwd = urlObj.searchParams.get('pwd');
+        if (!authRoom(room, pwd)) { res.writeHead(403); return res.end('[]'); }
+        
+        const recDir = path.join(__dirname, 'recordings');
+        if (!fs.existsSync(recDir)) { res.writeHead(200); return res.end('[]'); }
+        
+        const files = fs.readdirSync(recDir).filter(f => f.startsWith(room + '_') && f.endsWith('.webm'));
+        const list = files.map(f => {
+            const parts = f.replace('.webm', '').split('_');
+            return { filename: f, camId: parts[1], start: parseInt(parts[2], 10) };
+        });
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(list));
+    }
+
+    // Serve Video File with Range Support (Allows Timeline Seeking)
+    if (urlObj.pathname.startsWith('/recordings/')) {
+        const filePath = path.join(__dirname, decodeURIComponent(urlObj.pathname));
+        if (!fs.existsSync(filePath)) { res.writeHead(404); return res.end(); }
+        
+        const stat = fs.statSync(filePath);
+        const range = req.headers.range;
+        
+        if (range) {
+            const parts = range.replace(/bytes=/, "").split("-");
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+            const chunksize = (end - start) + 1;
+            const file = fs.createReadStream(filePath, { start, end });
+            
+            res.writeHead(206, {
+                'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': chunksize,
+                'Content-Type': 'video/webm'
+            });
+            file.pipe(res);
+        } else {
+            res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': 'video/webm' });
+            fs.createReadStream(filePath).pipe(res);
+        }
+        return;
+    }
+
+    res.writeHead(404);
+    res.end();
 });
 
 // Raw WebSocket Server attached to HTTP
@@ -39,6 +115,8 @@ const clients = new Map(); // Map ws connection to { id, room }
 wss.on('connection', (ws) => {
     const clientId = crypto.randomUUID();
     clients.set(ws, { id: clientId, room: null });
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (message) => {
         let data;
@@ -116,6 +194,18 @@ function broadcastToRoom(roomName, msgObj, excludeWs = null) {
         }
     }
 }
+
+const interval = setInterval(() => {
+    for (const [ws] of clients.entries()) {
+        if (ws.isAlive === false) {
+            clients.delete(ws);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    }
+}, 30000);
+wss.on('close', () => clearInterval(interval));
 
 server.listen(PORT, () => {
     console.log(`Security Camera Server is running on port ${PORT}`);

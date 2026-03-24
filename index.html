@@ -127,6 +127,7 @@
         <div class="top-bar">
             <div>
                 <button class="top-left-btn" onclick="createCameraSequence()">Create Camera Sequence...</button>
+                <button class="top-left-btn" onclick="openHistory()" style="background: var(--success); margin-left: 10px;">See History</button>
                 <div class="controls-panel">
                     <button class="action-btn" id="flip-btn" onclick="flipCamera()" style="display:none;">Flip Camera</button>
                     <button class="action-btn" onclick="rotateCamera()">Rotate View</button>
@@ -142,7 +143,7 @@
                 No cameras active right now.<br><br>Please use the "Create Camera Sequence..." button in the top left corner to add one.
             </div>
             <!-- playsinline is critical for iPhone to prevent automatic fullscreen -->
-            <video id="main-video" autoplay playsinline style="display: none;"></video>
+            <video id="main-video" autoplay playsinline webkit-playsinline muted style="display: none;"></video>
         </div>
 
         <!-- Desktop Navigation -->
@@ -150,11 +151,37 @@
         <button class="nav-btn right" onclick="switchCam(1)">&#10095;</button>
 
     </div>
+    
+    <!-- HISTORY PAGE -->
+    <div id="history-page" class="page" style="flex-direction: column; background: #121212;">
+        <div class="top-bar" style="position: relative; width: 100%;">
+            <button class="top-left-btn" onclick="closeHistory()">Back to Live</button>
+            <div class="cam-status">Camera History</div>
+        </div>
+        
+        <div style="width:100%; height:100%; display:flex; flex-direction:column;">
+            <div id="history-list" style="padding: 15px; display:flex; gap: 10px; overflow-x:auto; background:#1e1e1e; min-height: 80px;">
+                <!-- Auto-populated history files -->
+            </div>
+            
+            <div style="flex-grow:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 20px;">
+                <video id="history-video" controls playsinline webkit-playsinline style="max-height: 60vh; max-width: 100%; display:none; border-radius: 8px;"></video>
+                <div id="history-info" style="color:white; margin-top: 20px; font-size: 20px; display:none; font-weight: bold;">
+                    Time: <span id="h-local-time" style="color:var(--primary);">--:--:--</span> | 
+                    Elapsed: <span id="h-elapsed" style="color:var(--success);">0:00:00</span>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <script>
         // --- Globals & State ---
         let ws;
         let localStream = null;
+        let currentRoom = '';
+        let currentPwd = '';
+        let mediaRecorder = null;
+        let recordingStartTime = 0;
         let peers = {}; // clientId -> RTCPeerConnection
         
         // Array of available camera streams. Format: { id: 'local' | clientId, stream: MediaStream }
@@ -240,6 +267,8 @@
             const roomName = document.getElementById(nameId).value.trim();
             const password = document.getElementById(pwdId).value.trim();
             if (!roomName || !password) return showToast('Name and Password required', true);
+            currentRoom = roomName;
+            currentPwd = password;
             ws.send(JSON.stringify({ type: action, roomName, password }));
         }
 
@@ -283,6 +312,7 @@
 
                 // Add to our camera array
                 allCameras.push({ id: 'local', stream: localStream });
+                startRecording(localStream);
                 currentViewIndex = allCameras.length - 1; 
                 updateVideoUI();
 
@@ -312,7 +342,15 @@
             noCamMsg.style.display = 'none';
             
             const currentCam = allCameras[currentViewIndex];
-            videoEl.srcObject = currentCam.stream;
+            // Clear source first to force iOS WebRTC engine to repaint
+            if (videoEl.srcObject !== currentCam.stream) {
+                videoEl.srcObject = null;
+                videoEl.srcObject = currentCam.stream;
+            }
+            // Explicitly prompt play on mobile
+            setTimeout(() => {
+                videoEl.play().catch(e => console.warn("Auto-play blocked", e));
+            }, 50);
             
             statusEl.innerText = `Viewing Camera ${currentViewIndex + 1} of ${allCameras.length}`;
             document.getElementById('flip-btn').style.display = (currentCam.id === 'local') ? 'inline-block' : 'none';
@@ -614,6 +652,80 @@
                     }
                 });
             }
+        }
+
+        // --- Recording & History Logic ---
+        function startRecording(stream) {
+            recordingStartTime = Date.now();
+            const mimeType = MediaRecorder.isTypeSupported('video/webm; codecs=vp8,opus') ? 'video/webm; codecs=vp8,opus' : 'video/webm';
+            
+            try { mediaRecorder = new MediaRecorder(stream, { mimeType }); } 
+            catch (e) { mediaRecorder = new MediaRecorder(stream); } // Safari fallback
+
+            mediaRecorder.ondataavailable = async (e) => {
+                if (e.data && e.data.size > 0 && currentRoom && currentPwd) {
+                    try {
+                        // Send chunks over HTTP to ensure persistent saves
+                        await fetch(`/upload?room=${encodeURIComponent(currentRoom)}&pwd=${encodeURIComponent(currentPwd)}&camId=${encodeURIComponent(myDeviceId)}&start=${recordingStartTime}`, {
+                            method: 'POST', body: e.data
+                        });
+                    } catch(err) {}
+                }
+            };
+            mediaRecorder.start(5000); // Send chunks to server every 5 seconds securely
+        }
+
+        async function openHistory() {
+            if (!currentRoom) return showToast("Join a room first.", true);
+            const res = await fetch(`/recordings-list?room=${encodeURIComponent(currentRoom)}&pwd=${encodeURIComponent(currentPwd)}`);
+            const list = await res.json();
+            
+            const listContainer = document.getElementById('history-list');
+            listContainer.innerHTML = '';
+            
+            if (list.length === 0) listContainer.innerHTML = '<div style="color:#aaa;">No history found.</div>';
+            
+            list.forEach(item => {
+                const btn = document.createElement('button');
+                btn.className = 'menu-btn';
+                btn.style.width = 'auto'; btn.style.padding = '10px'; btn.style.margin = '0';
+                btn.innerText = `Cam: ${item.camId.substring(0,6)}\nStarted: ${new Date(item.start).toLocaleTimeString()}`;
+                btn.onclick = () => playHistory(item);
+                listContainer.appendChild(btn);
+            });
+            switchPage('history-page');
+        }
+
+        function playHistory(item) {
+            const video = document.getElementById('history-video');
+            document.getElementById('history-info').style.display = 'block';
+            video.style.display = 'block';
+            video.src = `/recordings/${item.filename}`;
+            video.play().catch(()=>{}); // Load into player
+            
+            if (window.historyInterval) clearInterval(window.historyInterval);
+            window.historyInterval = setInterval(() => {
+                // Dynamically calculates timeline metrics while you scroll the bar
+                if (!video.paused && !video.seeking) {
+                    const currentTime = video.currentTime;
+                    const actualTime = new Date(item.start + (currentTime * 1000));
+                    
+                    document.getElementById('h-local-time').innerText = actualTime.toLocaleTimeString();
+                    
+                    const hrs = Math.floor(currentTime / 3600);
+                    const mins = Math.floor((currentTime % 3600) / 60);
+                    const secs = Math.floor(currentTime % 60);
+                    document.getElementById('h-elapsed').innerText = `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                }
+            }, 500);
+        }
+
+        function closeHistory() {
+            const video = document.getElementById('history-video');
+            video.pause();
+            video.src = "";
+            if (window.historyInterval) clearInterval(window.historyInterval);
+            switchPage('room-page');
         }
     </script>
 </body>

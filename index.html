@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Local Security Camera System</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --panel-bg: #1e1e1e;
+            --primary: #3498db;
+            --text: #ffffff;
+            --danger: #e74c3c;
+            --success: #2ecc71;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: var(--bg-color); color: var(--text); overflow: hidden; }
+
+        /* Custom Toast Notifications */
+        #toast-container { position: fixed; top: 20px; right: 20px; z-index: 10000; display: flex; flex-direction: column; gap: 10px; }
+        .toast { background: var(--panel-bg); color: var(--text); padding: 15px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); transition: opacity 0.3s; display: flex; align-items: center; border-left: 4px solid var(--primary); }
+        .toast.error { border-left-color: var(--danger); }
+        .toast.success { border-left-color: var(--success); }
+
+        /* Pages */
+        .page { display: none; width: 100vw; height: 100vh; flex-direction: column; align-items: center; justify-content: center; }
+        .page.active { display: flex; }
+
+        /* Main Menu Buttons */
+        .menu-btn { background: var(--primary); color: white; border: none; padding: 15px 30px; margin: 10px; font-size: 18px; border-radius: 8px; cursor: pointer; width: 250px; transition: background 0.2s; }
+        .menu-btn:active { opacity: 0.8; }
+
+        /* Modals */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.active { display: flex; }
+        .modal-content { background: var(--panel-bg); padding: 30px; border-radius: 12px; width: 90%; max-width: 400px; }
+        .modal-content h2 { margin-bottom: 20px; text-align: center; }
+        .input-group { margin-bottom: 15px; position: relative; }
+        .input-group input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background: #2a2a2a; color: white; font-size: 16px; }
+        .pwd-toggle { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #aaa; font-size: 20px; cursor: pointer; padding: 5px; }
+        .modal-actions { display: flex; justify-content: space-between; gap: 10px; margin-top: 25px; }
+        .modal-actions button { flex: 1; padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; color: white; }
+        .btn-cancel { background: #555; }
+        .btn-submit { background: var(--primary); }
+
+        /* In-Room UI */
+        #room-page { position: relative; }
+        .top-bar { position: absolute; top: 0; left: 0; width: 100%; padding: 15px; background: rgba(0,0,0,0.6); display: flex; justify-content: space-between; align-items: center; z-index: 100; }
+        .top-left-btn { background: var(--danger); border: none; color: white; padding: 10px 15px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .cam-status { font-size: 16px; font-weight: bold; background: rgba(0,0,0,0.5); padding: 5px 15px; border-radius: 20px; }
+        
+        .video-container { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #000; }
+        video { width: 100%; height: 100%; object-fit: contain; }
+        
+        .no-cam-msg { position: absolute; text-align: center; font-size: 18px; color: #888; max-width: 80%; }
+
+        /* Camera Navigation Controls */
+        .nav-btn { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.2); border: none; color: white; font-size: 30px; padding: 20px 15px; cursor: pointer; border-radius: 8px; z-index: 100; backdrop-filter: blur(5px); }
+        .nav-btn.left { left: 20px; }
+        .nav-btn.right { right: 20px; }
+        .mobile-nav-panel { display: none; }
+
+        /* Mobile specific layout */
+        @media (max-width: 768px) {
+            .nav-btn { display: none; } /* hide desktop arrows */
+            .mobile-nav-panel { display: flex; position: absolute; bottom: 30px; width: 100%; justify-content: space-around; z-index: 100; padding: 0 20px; gap: 15px; }
+            .mobile-nav-panel button { flex: 1; background: rgba(255,255,255,0.2); border: none; color: white; padding: 15px; font-size: 18px; border-radius: 8px; backdrop-filter: blur(5px); }
+            .top-bar { flex-direction: column; gap: 10px; align-items: flex-start; }
+            .cam-status { align-self: center; margin-top: 5px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Toast Notifications (No Alerts) -->
+    <div id="toast-container"></div>
+
+    <!-- MAIN PAGE -->
+    <div id="main-page" class="page active">
+        <h1 style="margin-bottom: 40px;">Security Cameras</h1>
+        <button class="menu-btn" onclick="openModal('create-modal')">Create Room...</button>
+        <button class="menu-btn" onclick="openModal('join-modal')">Join Room...</button>
+    </div>
+
+    <!-- CREATE ROOM MODAL -->
+    <div id="create-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Create Room</h2>
+            <div class="input-group">
+                <input type="text" id="c-name" placeholder="Enter Room Name">
+            </div>
+            <div class="input-group">
+                <input type="password" id="c-pwd" placeholder="Enter Room Password">
+                <button type="button" class="pwd-toggle" onclick="togglePwd('c-pwd')">👁</button>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal('create-modal')">Cancel</button>
+                <button class="btn-submit" onclick="submitRoom('CREATE_ROOM', 'c-name', 'c-pwd')">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- JOIN ROOM MODAL -->
+    <div id="join-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Join Room</h2>
+            <div class="input-group">
+                <input type="text" id="j-name" placeholder="Enter Room Name">
+            </div>
+            <div class="input-group">
+                <input type="password" id="j-pwd" placeholder="Enter Room Password">
+                <button type="button" class="pwd-toggle" onclick="togglePwd('j-pwd')">👁</button>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal('join-modal')">Cancel</button>
+                <button class="btn-submit" onclick="submitRoom('JOIN_ROOM', 'j-name', 'j-pwd')">Join</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ROOM PAGE -->
+    <div id="room-page" class="page">
+        <div class="top-bar">
+            <button class="top-left-btn" onclick="createCameraSequence()">Create Camera Sequence...</button>
+            <div class="cam-status" id="cam-status">No Cameras Connected</div>
+        </div>
+
+        <div class="video-container">
+            <div id="no-cam-msg" class="no-cam-msg">
+                No cameras active right now.<br><br>Please use the "Create Camera Sequence..." button in the top left corner to add one.
+            </div>
+            <!-- playsinline is critical for iPhone to prevent automatic fullscreen -->
+            <video id="main-video" autoplay playsinline style="display: none;"></video>
+        </div>
+
+        <!-- Desktop Navigation -->
+        <button class="nav-btn left" onclick="switchCam(-1)">&#10094;</button>
+        <button class="nav-btn right" onclick="switchCam(1)">&#10095;</button>
+
+        <!-- Mobile Navigation -->
+        <div class="mobile-nav-panel">
+            <button onclick="switchCam(-1)">&#10094; Prev Camera</button>
+            <button onclick="switchCam(1)">Next Camera &#10095;</button>
+        </div>
+    </div>
+
+    <script>
+        // --- Globals & State ---
+        let ws;
+        let localStream = null;
+        let peers = {}; // clientId -> RTCPeerConnection
+        
+        // Array of available camera streams. Format: { id: 'local' | clientId, stream: MediaStream }
+        let allCameras =[]; 
+        let currentViewIndex = 0;
+
+        const ICE_SERVERS = { iceServers:[{ urls: 'stun:stun.l.google.com:19302' }] };
+
+        // --- Utility UI Functions ---
+        function showToast(message, isError = false) {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${isError ? 'error' : 'success'}`;
+            toast.innerText = message;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        function openModal(id) { document.getElementById(id).classList.add('active'); }
+        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+        function togglePwd(id) {
+            const el = document.getElementById(id);
+            el.type = el.type === 'password' ? 'text' : 'password';
+        }
+
+        function switchPage(pageId) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.getElementById(pageId).classList.add('active');
+        }
+
+        // --- WebSocket Setup ---
+        function connectWS() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}`);
+
+            ws.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+
+                switch (data.type) {
+                    case 'ERROR':
+                        showToast(data.message, true);
+                        break;
+                    case 'ROOM_JOINED':
+                        closeModal('create-modal');
+                        closeModal('join-modal');
+                        switchPage('room-page');
+                        showToast(`Joined Room: ${data.roomName}`, false);
+                        break;
+                    case 'CLIENT_JOINED':
+                        // A new viewer/peer joined. We initiate WebRTC connection.
+                        createPeerConnection(data.clientId, true);
+                        break;
+                    case 'CLIENT_LEFT':
+                        handlePeerDisconnect(data.clientId);
+                        break;
+                    case 'SIGNAL':
+                        await handleWebRTCSignal(data.fromId, data.signal);
+                        break;
+                }
+            };
+            ws.onclose = () => setTimeout(connectWS, 2000); // Auto reconnect
+        }
+        window.onload = connectWS;
+
+        function submitRoom(action, nameId, pwdId) {
+            const roomName = document.getElementById(nameId).value.trim();
+            const password = document.getElementById(pwdId).value.trim();
+            if (!roomName || !password) return showToast('Name and Password required', true);
+            ws.send(JSON.stringify({ type: action, roomName, password }));
+        }
+
+        // --- Camera & Stream Logic ---
+        async function createCameraSequence() {
+            if (!navigator.mediaDevices) {
+                return showToast("Camera API denied. Ensure you are on HTTPS or localhost.", true);
+            }
+            if (localStream) return showToast("You are already streaming your camera.", true);
+
+            try {
+                // High Quality & High FPS WebRTC constraints
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
+                    audio: true
+                });
+
+                showToast("Camera access allowed. Streaming started.", false);
+
+                // Add to our camera array
+                allCameras.push({ id: 'local', stream: localStream });
+                currentViewIndex = allCameras.length - 1; 
+                updateVideoUI();
+
+                // Add stream to all existing WebRTC peer connections to share it
+                Object.values(peers).forEach(pc => {
+                    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                });
+
+            } catch (err) {
+                showToast("Camera permission denied or unavailable.", true);
+            }
+        }
+
+        function updateVideoUI() {
+            const videoEl = document.getElementById('main-video');
+            const noCamMsg = document.getElementById('no-cam-msg');
+            const statusEl = document.getElementById('cam-status');
+
+            if (allCameras.length === 0) {
+                videoEl.style.display = 'none';
+                noCamMsg.style.display = 'block';
+                statusEl.innerText = "No Cameras Connected";
+                return;
+            }
+
+            videoEl.style.display = 'block';
+            noCamMsg.style.display = 'none';
+            
+            const currentCam = allCameras[currentViewIndex];
+            videoEl.srcObject = currentCam.stream;
+            
+            // Prevent audio feedback loop if viewing own camera locally
+            videoEl.muted = (currentCam.id === 'local');
+            
+            statusEl.innerText = `Viewing Camera ${currentViewIndex + 1} of ${allCameras.length}`;
+        }
+
+        function switchCam(direction) {
+            if (allCameras.length <= 1) return;
+            currentViewIndex = (currentViewIndex + direction + allCameras.length) % allCameras.length;
+            updateVideoUI();
+        }
+
+        // --- WebRTC Core Logic ---
+        
+        function sendSignal(targetId, signal) {
+            ws.send(JSON.stringify({ type: 'SIGNAL', targetId, signal }));
+        }
+
+        function createPeerConnection(peerId, isInitiator) {
+            if (peers[peerId]) return peers[peerId];
+
+            const pc = new RTCPeerConnection(ICE_SERVERS);
+            peers[peerId] = pc;
+
+            // Send local stream if we are a camera host
+            if (localStream) {
+                localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            }
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    sendSignal(peerId, { type: 'ice', candidate: event.candidate });
+                }
+            };
+
+            pc.ontrack = (event) => {
+                // When we receive a camera feed from someone else
+                const stream = event.streams[0];
+                if (!allCameras.find(c => c.id === peerId)) {
+                    allCameras.push({ id: peerId, stream });
+                    showToast("New remote camera sequence linked.", false);
+                    updateVideoUI();
+                }
+            };
+
+            pc.onnegotiationneeded = async () => {
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    sendSignal(peerId, { type: 'offer', sdp: pc.localDescription });
+                } catch (err) { console.error(err); }
+            };
+
+            return pc;
+        }
+
+        async function handleWebRTCSignal(fromId, signal) {
+            let pc = peers[fromId];
+
+            if (signal.type === 'offer') {
+                if (!pc) pc = createPeerConnection(fromId, false);
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSignal(fromId, { type: 'answer', sdp: pc.localDescription });
+            } 
+            else if (signal.type === 'answer') {
+                if (pc) await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+            } 
+            else if (signal.type === 'ice') {
+                if (pc) await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+            }
+        }
+
+        function handlePeerDisconnect(peerId) {
+            if (peers[peerId]) {
+                peers[peerId].close();
+                delete peers[peerId];
+            }
+            // Remove disconnected cameras from UI
+            const initialLength = allCameras.length;
+            allCameras = allCameras.filter(c => c.id !== peerId);
+            
+            if (allCameras.length < initialLength) {
+                showToast("A camera feed disconnected.", true);
+                if (currentViewIndex >= allCameras.length) {
+                    currentViewIndex = Math.max(0, allCameras.length - 1);
+                }
+                updateVideoUI();
+            }
+        }
+    </script>
+</body>
+</html>

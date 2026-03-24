@@ -55,18 +55,16 @@
         .no-cam-msg { position: absolute; text-align: center; font-size: 18px; color: #888; max-width: 80%; }
 
         /* Camera Navigation Controls */
-        .nav-btn { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.2); border: none; color: white; font-size: 30px; padding: 20px 15px; cursor: pointer; border-radius: 8px; z-index: 100; backdrop-filter: blur(5px); }
-        .nav-btn.left { left: 20px; }
-        .nav-btn.right { right: 20px; }
-        .mobile-nav-panel { display: none; }
+        .nav-btn { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.4); border: none; color: white; font-size: 30px; padding: 20px 15px; cursor: pointer; border-radius: 8px; z-index: 100; backdrop-filter: blur(5px); transition: background 0.3s; }
+        .nav-btn:active { background: rgba(0,0,0,0.8); }
+        .nav-btn.left { left: 10px; }
+        .nav-btn.right { right: 10px; }
 
         /* Mobile specific layout */
         @media (max-width: 768px) {
-            .nav-btn { display: none; } /* hide desktop arrows */
-            .mobile-nav-panel { display: flex; position: absolute; bottom: 30px; width: 100%; justify-content: space-around; z-index: 100; padding: 0 20px; gap: 15px; }
-            .mobile-nav-panel button { flex: 1; background: rgba(255,255,255,0.2); border: none; color: white; padding: 15px; font-size: 18px; border-radius: 8px; backdrop-filter: blur(5px); }
             .top-bar { flex-direction: column; gap: 10px; align-items: flex-start; }
             .cam-status { align-self: center; margin-top: 5px; }
+            .nav-btn { padding: 15px 10px; font-size: 24px; }
         }
         /* New Controls */
         .controls-panel { display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap; }
@@ -150,11 +148,6 @@
         <button class="nav-btn left" onclick="switchCam(-1)">&#10094;</button>
         <button class="nav-btn right" onclick="switchCam(1)">&#10095;</button>
 
-        <!-- Mobile Navigation -->
-        <div class="mobile-nav-panel">
-            <button onclick="switchCam(-1)">&#10094; Prev Camera</button>
-            <button onclick="switchCam(1)">Next Camera &#10095;</button>
-        </div>
     </div>
 
     <script>
@@ -168,6 +161,8 @@
         let currentViewIndex = 0;
         let currentFacingMode = "environment";
         let pttStream = null;
+        let pttSenders = {}; // Maps peerId to RTCRtpSender for targeted audio
+        let wakeLock = null; // Prevents phones from sleeping and causing black screens
 
         // Device fingerprinting for saving rotation
         let myDeviceId = localStorage.getItem('sec_cam_device_id');
@@ -246,6 +241,27 @@
             ws.send(JSON.stringify({ type: action, roomName, password }));
         }
 
+        // --- Prevent Black Screens / Auto-Sleep ---
+        async function requestWakeLock() {
+            if ('wakeLock' in navigator) {
+                try { wakeLock = await navigator.wakeLock.request('screen'); } 
+                catch (err) { console.error('Wake Lock error:', err); }
+            }
+        }
+        document.addEventListener('visibilitychange', async () => {
+            if (wakeLock !== null && document.visibilityState === 'visible') requestWakeLock();
+        });
+        
+        // Ensure video doesn't pause unexpectedly on mobile browsers
+        document.addEventListener('DOMContentLoaded', () => {
+            const videoEl = document.getElementById('main-video');
+            if(videoEl) {
+                videoEl.addEventListener('pause', () => {
+                    if (videoEl.srcObject) videoEl.play().catch(()=>{});
+                });
+            }
+        });
+        
         // --- Camera & Stream Logic ---
         async function createCameraSequence() {
             if (!navigator.mediaDevices) {
@@ -261,6 +277,7 @@
                 });
 
                 showToast("Camera access allowed. Streaming started.", false);
+                await requestWakeLock(); // Keeps the phone screen on while acting as a camera
 
                 // Add to our camera array
                 allCameras.push({ id: 'local', stream: localStream });
@@ -325,6 +342,12 @@
             // Send local stream if we are a camera host
             if (localStream) {
                 localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            }
+            // If Intercom is ready, set up a targeted audio track (muted by default)
+            if (pttStream) {
+                const sender = pc.addTrack(pttStream.getAudioTracks()[0], pttStream);
+                pttSenders[peerId] = sender;
+                sender.replaceTrack(null).catch(()=>{}); 
             }
 
             pc.onicecandidate = (event) => {
@@ -466,16 +489,19 @@
             applyRotation();
         }
 
-        // --- Push-To-Talk Logic ---
+        // --- Targeted Push-To-Talk Logic ---
         async function initPTT() {
             if (!pttStream) {
                 try {
                     pttStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    pttStream.getAudioTracks()[0].enabled = false; // Muted by default
+                    const track = pttStream.getAudioTracks()[0];
+                    track.enabled = false; // Muted by default
                     
-                    // Add our audio to the WebRTC connection mesh
-                    Object.values(peers).forEach(pc => {
-                        pttStream.getTracks().forEach(track => pc.addTrack(track, pttStream));
+                    // Add our audio framework to connections, but replace track with null to keep it silent
+                    Object.entries(peers).forEach(([peerId, pc]) => {
+                        const sender = pc.addTrack(track, pttStream);
+                        pttSenders[peerId] = sender;
+                        sender.replaceTrack(null).catch(()=>{}); 
                     });
                     showToast("Microphone enabled for Intercom.", false);
                     return true;
@@ -490,9 +516,22 @@
         async function startSpeak(e) {
             e.preventDefault();
             if (allCameras.length === 0 || allCameras[currentViewIndex].id === 'local') return;
+            const targetPeerId = allCameras[currentViewIndex].id;
             const ready = await initPTT();
+            
             if (ready && pttStream) {
-                pttStream.getAudioTracks()[0].enabled = true; // Unmute
+                const pttTrack = pttStream.getAudioTracks()[0];
+                pttTrack.enabled = true; // Unmute
+                
+                // Route audio ONLY to the camera we are currently viewing
+                Object.entries(pttSenders).forEach(([peerId, sender]) => {
+                    if (peerId === targetPeerId) {
+                        sender.replaceTrack(pttTrack).catch(()=>{});
+                    } else {
+                        sender.replaceTrack(null).catch(()=>{});
+                    }
+                });
+                
                 document.getElementById('speak-btn').style.backgroundColor = 'var(--danger)';
             }
         }
@@ -500,7 +539,13 @@
         function stopSpeak(e) {
             e.preventDefault();
             if (pttStream) {
-                pttStream.getAudioTracks()[0].enabled = false; // Mute
+                pttStream.getAudioTracks()[0].enabled = false; // Mute locally
+                
+                // Disconnect track from all peers to halt transmission completely
+                Object.values(pttSenders).forEach(sender => {
+                    sender.replaceTrack(null).catch(()=>{});
+                });
+                
                 document.getElementById('speak-btn').style.backgroundColor = 'var(--primary)';
             }
         }
